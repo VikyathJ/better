@@ -1,0 +1,6 @@
+[servers]
+"server1" = { address = "http://localhost:8081", weight = 1, healthy = true }
+"server2" = { address = "http://localhost:8082", weight = 2, healthy = true }
+
+# Rate limit of 100 requests per interval
+rate_limit = 100
