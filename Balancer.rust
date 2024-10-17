@@ -1,0 +1,173 @@
+use reqwest::{Client, StatusCode};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as TokioMutex;
+use tokio::time::{interval, Duration};
+use tokio::signal::ctrl_c;
+use std::fs;
+use log::{info, error};
+use config::Config as ConfigLoader;
+use std::num::NonZeroU32;
+use futures::lock::Mutex as FuturesMutex;
+
+#[derive(Deserialize, Debug, Clone)]
+struct ServerConfig {
+    address: String,
+    weight: usize,
+    healthy: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct Config {
+    servers: HashMap<String, ServerConfig>,
+    rate_limit: Option<u32>,
+}
+
+struct LoadBalancer {
+    servers: Arc<TokioMutex<Vec<ServerConfig>>>,
+    client: Client,
+    rate_limit: Arc<FuturesMutex<NonZeroU32>>,
+    requests: Arc<TokioMutex<u32>>, // Track the number of requests
+}
+
+impl LoadBalancer {
+    fn new(servers: HashMap<String, ServerConfig>, rate_limit: Option<u32>) -> Self {
+        LoadBalancer {
+            servers: Arc::new(TokioMutex::new(servers.into_iter().map(|(_, v)| v).collect())),
+            client: Client::new(),
+            rate_limit: Arc::new(FuturesMutex::new(rate_limit.unwrap_or(100).into())),
+            requests: Arc::new(TokioMutex::new(0)),
+        }
+    }
+
+    async fn health_check(&self) {
+        let servers = self.servers.clone();
+        let mut interval = interval(Duration::from_secs(10));
+
+        loop {
+            interval.tick().await;
+            let mut servers = servers.lock().await;
+
+            for server in servers.iter_mut() {
+                match self.client.get(format!("{}/health", server.address)).send().await {
+                    Ok(response) if response.status() == StatusCode::OK => {
+                        info!("{} is healthy", server.address);
+                        server.healthy = true;
+                    }
+                    _ => {
+                        error!("{} is unhealthy", server.address);
+                        server.healthy = false;
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_next_server(&self) -> Option<ServerConfig> {
+        let servers = self.servers.lock().unwrap();
+        let healthy_servers: Vec<&ServerConfig> = servers.iter().filter(|s| s.healthy).collect();
+
+        if healthy_servers.is_empty() {
+            return None;
+        }
+
+        let total_weight: usize = healthy_servers.iter().map(|s| s.weight).sum();
+        let random_weight = rand::random::<usize>() % total_weight;
+        let mut cumulative_weight = 0;
+
+        for server in healthy_servers {
+            cumulative_weight += server.weight;
+            if cumulative_weight > random_weight {
+                return Some(server.clone());
+            }
+        }
+
+        None
+    }
+
+    async fn handle_client(&self, addr: std::net::SocketAddr) {
+        // Rate limiting logic
+        {
+            let mut requests = self.requests.lock().await;
+            if *requests >= *self.rate_limit.lock().await {
+                error!("Rate limit exceeded from {}", addr);
+                return;
+            }
+            *requests += 1;
+        }
+
+        if let Some(server) = self.get_next_server() {
+            info!("Forwarding request to {}", server.address);
+            // Here, you would forward the request to the selected server.
+            // Simulate request forwarding
+            let _ = self.client.get(&server.address).send().await;
+        } else {
+            error!("No available servers to handle the request from {}", addr);
+        }
+    }
+
+    async fn run(&self, port: u16) {
+        let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap();
+
+        loop {
+            match listener.accept() {
+                Ok((socket, addr)) => {
+                    let lb_clone = self.clone();
+                    tokio::spawn(async move {
+                        lb_clone.handle_client(addr).await;
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to accept connection: {}", e);
+                }
+            }
+        }
+    }
+
+    async fn reload_config(&self) {
+        let servers = self.servers.clone();
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await; // Check every 30 seconds
+
+            // Reload the configuration
+            let new_config: Config = ConfigLoader::load("config.toml").unwrap();
+            let new_servers: HashMap<String, ServerConfig> = new_config.servers.clone();
+            let mut servers_lock = servers.lock().await;
+            *servers_lock = new_servers.into_iter().map(|(_, v)| v).collect();
+            info!("Reloaded configuration");
+        }
+    }
+
+    async fn graceful_shutdown(&self) {
+        let _ = ctrl_c().await;
+        info!("Shutting down gracefully...");
+        // Perform cleanup and shutdown logic here
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    // Set up logging
+    env_logger::init();
+
+    // Load initial configuration
+    let config: Config = ConfigLoader::load("config.toml").unwrap();
+    let lb = LoadBalancer::new(config.servers, config.rate_limit);
+
+    // Spawn health check and configuration reload tasks
+    tokio::spawn(async move {
+        lb.health_check().await;
+    });
+    
+    tokio::spawn(async move {
+        lb.reload_config().await;
+    });
+
+    // Run the load balancer
+    lb.run(8080).await;
+
+    // Handle graceful shutdown
+    lb.graceful_shutdown().await;
+}
