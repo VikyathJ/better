@@ -1,0 +1,11 @@
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio-timer = "0.2"
+log = "0.4"
+env_logger = "0.10"
+config = "0.11"
+futures = "0.3"
+ratelimit = "0.1"
+serde_json = "1.0"
